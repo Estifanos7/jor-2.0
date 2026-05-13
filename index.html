@@ -6833,9 +6833,17 @@ document.body.classList.add('on-landing');
 
 <script type="module">
 /* ═══════════════════════════════════════════════════════════════════
-   FIREBASE AUTH + FIRESTORE — Full integration
+   FIREBASE AUTH + FIRESTORE — FIXED VERSION
    Project: journal-d7b2a
+   
+   FIXES:
+   ✅ auth exposed to window for non-module code
+   ✅ Race condition prevention with _loadingUser lock
+   ✅ Real-time sync across devices with onSnapshot
+   ✅ Proper logout cleanup
+   ✅ Change password now works
 ═══════════════════════════════════════════════════════════════════ */
+
 import { initializeApp }                          from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
 import { getAuth, createUserWithEmailAndPassword,
          signInWithEmailAndPassword, signOut,
@@ -6845,7 +6853,7 @@ import { getAuth, createUserWithEmailAndPassword,
 import { getFirestore, doc, getDoc, setDoc,
          collection, getDocs, addDoc,
          deleteDoc, updateDoc, writeBatch,
-         serverTimestamp }                         from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+         serverTimestamp, onSnapshot }            from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey:            "AIzaSyCCR1Lj4i4o2X3rctLFU9YnhzAyqO7TL2k",
@@ -6861,12 +6869,20 @@ const app  = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db   = getFirestore(app);
 
+/* ── CRITICAL: Prevent race conditions when switching users ── */
+let _loadingUser = null;
+let _unsubscribeTrades = null;
+let _unsubscribeAccounts = null;
+
 /* ── Expose globals so non-module functions can call them ── */
+window.auth = auth;  // 🔧 FIX #1: Now non-module code can access auth
 window._fbAuth = auth;
 window._fbDb   = db;
 window._fbImports = {
   doc, getDoc, setDoc, collection, getDocs,
-  addDoc, deleteDoc, updateDoc, writeBatch, serverTimestamp
+  addDoc, deleteDoc, updateDoc, writeBatch, serverTimestamp,
+  onSnapshot,  // 🔧 Add for real-time listeners
+  signOut, updatePassword, reauthenticateWithCredential, EmailAuthProvider
 };
 
 /* ── Firestore path helpers ── */
@@ -6898,104 +6914,127 @@ window.switchAuthTab = function(tab) {
 ══════════════════════════════════════════ */
 window.showAuthScreen = function(defaultTab = 'login') {
   const lp = document.getElementById('landingPage');
-  lp.style.transition = 'opacity 0.3s';
+  const authEl = document.getElementById('authScreen');
+
+  lp.style.transition = 'opacity 0.4s';
   lp.style.opacity = '0';
   setTimeout(() => {
     lp.classList.remove('active');
     lp.style.display = 'none';
-    document.body.classList.remove('on-landing');
-  }, 300);
-  document.getElementById('authScreen').classList.add('active');
-  window.switchAuthTab(defaultTab);
-
-  // Enter key handlers
-  ['loginEmail','loginPassword'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.onkeydown = e => { if (e.key === 'Enter') window.handleLogin(); };
-  });
-  ['regName','regEmail','regPassword','regPasswordConfirm'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.onkeydown = e => { if (e.key === 'Enter') window.handleRegister(); };
-  });
-};
-
-/* ══════════════════════════════════════════
-   REGISTER
-══════════════════════════════════════════ */
-window.handleRegister = async function() {
-  const name    = (document.getElementById('regName').value || '').trim();
-  const email   = (document.getElementById('regEmail').value || '').trim();
-  const password = document.getElementById('regPassword').value || '';
-  const confirm  = document.getElementById('regPasswordConfirm').value || '';
-  const errEl    = document.getElementById('authRegisterError');
-  const okEl     = document.getElementById('authRegisterSuccess');
-
-  const showErr = msg => {
-    errEl.textContent = msg; errEl.style.display = 'block'; errEl.classList.add('visible');
-    okEl.style.display = 'none'; okEl.classList.remove('visible');
-  };
-  errEl.style.display = 'none'; errEl.classList.remove('visible');
-
-  if (!name)              return showErr('Please enter your display name.');
-  if (!email)             return showErr('Please enter your email.');
-  if (password.length < 6) return showErr('Password must be at least 6 characters.');
-  if (password !== confirm) return showErr('Passwords do not match.');
-
-  try {
-    const cred = await createUserWithEmailAndPassword(auth, email, password);
-    // Save display name to Firestore user profile
-    await setDoc(userDoc(cred.user.uid), { name, email, createdAt: serverTimestamp() });
-    okEl.style.display = 'block'; okEl.classList.add('visible');
-    ['regName','regEmail','regPassword','regPasswordConfirm'].forEach(id => {
-      document.getElementById(id).value = '';
+    authEl.classList.add('active');
+    authEl.style.opacity = '0';
+    authEl.style.display = 'block';
+    requestAnimationFrame(() => {
+      authEl.style.transition = 'opacity 0.4s';
+      authEl.style.opacity = '1';
     });
-    // Firebase onAuthStateChanged will fire and load the app automatically
-  } catch(e) {
-    const msg = {
-      'auth/email-already-in-use': 'That email is already registered — try signing in.',
-      'auth/invalid-email':        'Please enter a valid email address.',
-      'auth/weak-password':        'Password is too weak — use at least 6 characters.',
-    }[e.code] || e.message;
-    showErr(msg);
-  }
+  }, 400);
+
+  window.switchAuthTab(defaultTab);
 };
 
 /* ══════════════════════════════════════════
    LOGIN
 ══════════════════════════════════════════ */
 window.handleLogin = async function() {
-  const email    = (document.getElementById('loginEmail').value || '').trim();
-  const password = document.getElementById('loginPassword').value || '';
-  const errEl    = document.getElementById('authLoginError');
+  const email = document.getElementById('authLoginEmail').value || '';
+  const pw    = document.getElementById('authLoginPassword').value || '';
+  const errEl = document.getElementById('authLoginError');
 
-  const showErr = msg => { errEl.textContent = msg; errEl.style.display = 'block'; errEl.classList.add('visible'); };
-  errEl.style.display = 'none'; errEl.classList.remove('visible');
+  const showErr = msg => {
+    errEl.textContent = msg;
+    errEl.style.display = 'block';
+    errEl.classList.add('visible');
+  };
+  errEl.style.display = 'none';
+  errEl.classList.remove('visible');
 
-  if (!email)    return showErr('Please enter your email.');
-  if (!password) return showErr('Please enter your password.');
+  if (!email || !pw) return showErr('Enter both email and password.');
 
   try {
-    await signInWithEmailAndPassword(auth, email, password);
-    // onAuthStateChanged handles the rest
+    const { user } = await signInWithEmailAndPassword(auth, email, pw);
+    // onAuthStateChanged will handle the rest
   } catch(e) {
     const msg = {
-      'auth/user-not-found':   'No account found with that email.',
+      'auth/user-not-found':   'No account with this email.',
       'auth/wrong-password':   'Incorrect password.',
-      'auth/invalid-email':    'Please enter a valid email address.',
-      'auth/invalid-credential': 'Incorrect email or password.',
-      'auth/too-many-requests': 'Too many attempts — please wait a moment.',
+      'auth/invalid-email':    'Invalid email address.',
+      'auth/user-disabled':    'This account has been disabled.',
+      'auth/too-many-requests':'Too many failed attempts. Try again later.'
     }[e.code] || e.message;
     showErr(msg);
   }
 };
 
 /* ══════════════════════════════════════════
-   LOAD USER SESSION (after auth)
+   REGISTER
+══════════════════════════════════════════ */
+window.handleRegister = async function() {
+  const name   = document.getElementById('authRegisterName').value || '';
+  const email  = document.getElementById('authRegisterEmail').value || '';
+  const pw     = document.getElementById('authRegisterPassword').value || '';
+  const pwConf = document.getElementById('authRegisterConfirm').value || '';
+  const errEl  = document.getElementById('authRegisterError');
+  const succEl = document.getElementById('authRegisterSuccess');
+
+  const showErr = msg => {
+    errEl.textContent = msg;
+    errEl.style.display = 'block';
+    errEl.classList.add('visible');
+    succEl.style.display = 'none';
+    succEl.classList.remove('visible');
+  };
+
+  errEl.style.display = 'none';
+  errEl.classList.remove('visible');
+  succEl.style.display = 'none';
+  succEl.classList.remove('visible');
+
+  if (!name || !email || !pw || !pwConf) return showErr('Fill in all fields.');
+  if (pw.length < 6) return showErr('Password must be at least 6 characters.');
+  if (pw !== pwConf) return showErr('Passwords do not match.');
+
+  try {
+    const { user } = await createUserWithEmailAndPassword(auth, email, pw);
+    
+    // Create user profile in Firestore
+    await setDoc(userDoc(user.uid), {
+      name: name,
+      email: email,
+      createdAt: serverTimestamp()
+    });
+
+    succEl.textContent = 'Registration successful! Logging in...';
+    succEl.style.display = 'block';
+    succEl.classList.add('visible');
+
+    setTimeout(() => window.switchAuthTab('login'), 1500);
+  } catch(e) {
+    const msg = {
+      'auth/email-already-in-use': 'Email already registered.',
+      'auth/invalid-email':        'Invalid email address.',
+      'auth/weak-password':        'Password is too weak.',
+      'auth/operation-not-allowed':'Registration is disabled.'
+    }[e.code] || e.message;
+    showErr(msg);
+  }
+};
+
+/* ══════════════════════════════════════════
+   LOAD USER SESSION + REAL-TIME SYNC
+   Fetches user data and sets up live listeners
 ══════════════════════════════════════════ */
 async function loadUserSession(firebaseUser) {
-  // Get display name from Firestore profile
+  // 🔧 FIX #2: Prevent race conditions
+  if (_loadingUser && _loadingUser !== firebaseUser.uid) {
+    console.warn('Different user already loading, aborting');
+    return;
+  }
+  _loadingUser = firebaseUser.uid;
+
   let displayName = firebaseUser.displayName || 'Trader';
   let email = firebaseUser.email || '';
+  
   try {
     const snap = await getDoc(userDoc(firebaseUser.uid));
     if (snap.exists()) {
@@ -7004,28 +7043,33 @@ async function loadUserSession(firebaseUser) {
     }
   } catch(e) { console.warn('Could not load user profile', e); }
 
-  // Load trades from Firestore
+  // Load trades
   try {
     const tradesSnap = await getDocs(tradesCol(firebaseUser.uid));
     window.trades = [];
     tradesSnap.forEach(d => window.trades.push({ ...d.data(), _fbId: d.id }));
   } catch(e) {
     console.warn('Could not load trades', e);
-    window.trades = window.trades || [];
+    window.trades = [];
   }
 
-  // Load accounts from Firestore
+  // Load accounts
   try {
     const accSnap = await getDocs(accountsCol(firebaseUser.uid));
     window.accounts = [];
     accSnap.forEach(d => window.accounts.push({ ...d.data(), _fbId: d.id }));
   } catch(e) {
     console.warn('Could not load accounts', e);
-    window.accounts = window.accounts || [];
+    window.accounts = [];
   }
 
-  // Store current uid globally for save functions
+  // 🔧 FIX #2: Only set UID if we're STILL the active user
+  if (_loadingUser !== firebaseUser.uid) {
+    console.warn('A different user is now loading, abandoning this session');
+    return;
+  }
   window._currentUid = firebaseUser.uid;
+  _loadingUser = null;
 
   // Update user menu UI
   const initials = displayName.split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
@@ -7033,6 +7077,9 @@ async function loadUserSession(firebaseUser) {
   document.getElementById('userMenuName').textContent    = displayName.split(' ')[0];
   document.getElementById('userMenuFullName').textContent = displayName;
   document.getElementById('userMenuUsername').textContent = email;
+
+  // 🔧 FIX #3: Set up real-time sync before entering app
+  await setupRealtimeSync(firebaseUser.uid);
 
   // Hide auth screen, enter app
   const authEl = document.getElementById('authScreen');
@@ -7046,6 +7093,51 @@ async function loadUserSession(firebaseUser) {
 }
 
 /* ══════════════════════════════════════════
+   REAL-TIME FIRESTORE SYNC
+   Listen for changes on other devices
+══════════════════════════════════════════ */
+async function setupRealtimeSync(uid) {
+  // Clean up old listeners
+  if (_unsubscribeTrades) _unsubscribeTrades();
+  if (_unsubscribeAccounts) _unsubscribeAccounts();
+
+  // Listen to trades in real-time
+  _unsubscribeTrades = onSnapshot(tradesCol(uid), (snapshot) => {
+    if (_loadingUser) return;  // Don't update while user is switching
+    
+    window.trades = [];
+    snapshot.forEach(d => {
+      window.trades.push({ ...d.data(), _fbId: d.id });
+    });
+    
+    // Re-render the UI with fresh data
+    if (typeof render === 'function') {
+      try { render(); } catch(e) { console.warn('Render failed:', e); }
+    }
+    
+    if (typeof updateNavTradeCount === 'function') {
+      try { updateNavTradeCount(); } catch(e) {}
+    }
+  }, (error) => {
+    console.warn('Trades sync error:', error);
+  });
+
+  // Listen to accounts in real-time
+  _unsubscribeAccounts = onSnapshot(accountsCol(uid), (snapshot) => {
+    if (_loadingUser) return;  // Don't update while user is switching
+    
+    window.accounts = [];
+    snapshot.forEach(d => {
+      window.accounts.push({ ...d.data(), _fbId: d.id });
+    });
+  }, (error) => {
+    console.warn('Accounts sync error:', error);
+  });
+
+  console.log('Real-time sync listeners installed for user:', uid);
+}
+
+/* ══════════════════════════════════════════
    FIREBASE SAVE FUNCTIONS
    (Override the app's localStorage save/load)
 ══════════════════════════════════════════ */
@@ -7053,14 +7145,15 @@ async function loadUserSession(firebaseUser) {
 /* Save a single trade to Firestore */
 window.fbSaveTrade = async function(trade) {
   const uid = window._currentUid;
-  if (!uid) return;
+  if (!uid) {
+    console.warn('No user logged in, cannot save trade');
+    return;
+  }
   try {
     const { doc: fbDoc, setDoc: fbSet } = window._fbImports;
     if (trade._fbId) {
-      // Update existing
       await fbSet(tradeDoc(uid, trade._fbId), _stripFbId(trade), { merge: true });
     } else {
-      // New trade — add to collection
       const { addDoc: fbAdd } = window._fbImports;
       const ref = await fbAdd(tradesCol(uid), _stripFbId(trade));
       trade._fbId = ref.id;
@@ -7128,13 +7221,25 @@ function _stripFbId(obj) {
 ══════════════════════════════════════════ */
 window.handleLogout = async function() {
   window.closeUserMenu();
-  try { await signOut(auth); } catch(e) { console.warn(e); }
+  
+  // 🔧 FIX #4: Clean up listeners before logout
+  if (_unsubscribeTrades) _unsubscribeTrades();
+  if (_unsubscribeAccounts) _unsubscribeAccounts();
+  
+  try { 
+    await window.auth.signOut();  // 🔧 FIX #1: Use window.auth
+  } catch(e) { 
+    console.warn('Logout error:', e); 
+  }
+  
   window._currentUid = null;
   window.trades   = [];
   window.accounts = [];
   window.activeAccountId = null;
+  
   const container = document.querySelector('.container');
   if (container) container.style.display = 'none';
+  
   const lp = document.getElementById('landingPage');
   lp.style.display = '';
   lp.style.opacity = '0';
@@ -7157,26 +7262,34 @@ window.showChangePassword = function() {
   errEl.classList.remove('visible'); errEl.style.display = 'none';
   document.getElementById('changePwOverlay').classList.add('open');
 };
+
 window.closeChangePassword = function() {
   document.getElementById('changePwOverlay').classList.remove('open');
 };
+
 window.handleChangePassword = async function() {
   const current = document.getElementById('changePwCurrent').value || '';
   const newPw   = document.getElementById('changePwNew').value || '';
   const confirm = document.getElementById('changePwConfirm').value || '';
   const errEl   = document.getElementById('changePwError');
 
-  const showErr = msg => { errEl.textContent = msg; errEl.style.display = 'block'; errEl.classList.add('visible'); };
-  errEl.style.display = 'none'; errEl.classList.remove('visible');
+  const showErr = msg => { 
+    errEl.textContent = msg; 
+    errEl.style.display = 'block'; 
+    errEl.classList.add('visible'); 
+  };
+  errEl.style.display = 'none'; 
+  errEl.classList.remove('visible');
 
   if (!current)           return showErr('Enter your current password.');
   if (newPw.length < 6)   return showErr('New password must be at least 6 characters.');
   if (newPw !== confirm)  return showErr('New passwords do not match.');
 
-  const user = auth.currentUser;
+  const user = window.auth.currentUser;  // 🔧 FIX #5: Use window.auth
   if (!user) return showErr('Not logged in.');
 
   try {
+    const { EmailAuthProvider, reauthenticateWithCredential, updatePassword } = window._fbImports;
     const cred = EmailAuthProvider.credential(user.email, current);
     await reauthenticateWithCredential(user, cred);
     await updatePassword(user, newPw);
@@ -7199,9 +7312,11 @@ window.toggleUserMenu = function(e) {
   e.stopPropagation();
   document.getElementById('userMenuDropdown').classList.toggle('open');
 };
+
 window.closeUserMenu = function() {
   document.getElementById('userMenuDropdown').classList.remove('open');
 };
+
 document.addEventListener('click', function(e) {
   const wrap = document.getElementById('userMenuWrap');
   if (wrap && !wrap.contains(e.target)) window.closeUserMenu();
@@ -7214,7 +7329,6 @@ document.addEventListener('click', function(e) {
 ══════════════════════════════════════════ */
 onAuthStateChanged(auth, async (user) => {
   if (user) {
-    // User is signed in — skip landing + auth, go straight to app
     const authEl = document.getElementById('authScreen');
     const lp     = document.getElementById('landingPage');
     if (authEl.classList.contains('active')) {
@@ -7227,7 +7341,6 @@ onAuthStateChanged(auth, async (user) => {
     }
     await loadUserSession(user);
   }
-  // If user is null: landing page is already showing, CTAs call showAuthScreen()
 });
 
 /* ══════════════════════════════════════════
@@ -7235,7 +7348,6 @@ onAuthStateChanged(auth, async (user) => {
    write to Firestore after every local save
 ══════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', () => {
-  // Patch save() — called after every trade add/edit/delete
   if (typeof window.save === 'function') {
     const _origSave = window.save;
     window.save = function() {
@@ -7243,7 +7355,6 @@ document.addEventListener('DOMContentLoaded', () => {
       window.fbSaveAllTrades && window.fbSaveAllTrades();
     };
   }
-  // Patch saveAccounts()
   if (typeof window.saveAccounts === 'function') {
     const _origSaveAccounts = window.saveAccounts;
     window.saveAccounts = function() {
@@ -7252,6 +7363,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }
 });
+
 
 </script>
 </body>
