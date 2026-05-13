@@ -5133,7 +5133,7 @@ function toggleFilterPopup(popupId, btnId, e) {
 /* ════════════════════════════════════════════════
    DATA
 ════════════════════════════════════════════════ */
-let trades = JSON.parse(localStorage.getItem('tj_trades') || '[]');
+let trades = [];
 let chipState = { conf: [], trend: [], setup: null };
 let editingTradeId = null;
 let filters = { outcome: 'All', setup: 'All' };
@@ -6146,7 +6146,7 @@ function closeCalDetail() {
 /* ════════════════════════════════════════════════
    ACCOUNTS
 ════════════════════════════════════════════════ */
-let accounts = JSON.parse(localStorage.getItem('tj_accounts') || '[]');
+let accounts = [];
 let editingAccountId = null;
 let activeAccountId = null;  // null = show all
 
@@ -6993,6 +6993,13 @@ window.handleLogin = async function() {
    LOAD USER SESSION (after auth)
 ══════════════════════════════════════════ */
 async function loadUserSession(firebaseUser) {
+  // Clear any stale cached data from a previous user
+  localStorage.removeItem('tj_trades');
+  localStorage.removeItem('tj_accounts');
+  window.trades   = [];
+  window.accounts = [];
+  window.activeAccountId = null;
+
   // Get display name from Firestore profile
   let displayName = firebaseUser.displayName || 'Trader';
   let email = firebaseUser.email || '';
@@ -7133,6 +7140,9 @@ window.handleLogout = async function() {
   window.trades   = [];
   window.accounts = [];
   window.activeAccountId = null;
+  // Clear local cache so next user starts clean
+  localStorage.removeItem('tj_trades');
+  localStorage.removeItem('tj_accounts');
   const container = document.querySelector('.container');
   if (container) container.style.display = 'none';
   const lp = document.getElementById('landingPage');
