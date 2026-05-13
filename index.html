@@ -6833,19 +6833,19 @@ document.body.classList.add('on-landing');
 
 <script type="module">
 /* ═══════════════════════════════════════════════════════════════════
-   FIREBASE AUTH + FIRESTORE — Full integration
+   FIREBASE AUTH + FIRESTORE
    Project: journal-d7b2a
 ═══════════════════════════════════════════════════════════════════ */
-import { initializeApp }                          from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { initializeApp }                           from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
 import { getAuth, createUserWithEmailAndPassword,
          signInWithEmailAndPassword, signOut,
          onAuthStateChanged, updatePassword,
          reauthenticateWithCredential,
-         EmailAuthProvider }                       from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+         EmailAuthProvider }                        from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import { getFirestore, doc, getDoc, setDoc,
          collection, getDocs, addDoc,
-         deleteDoc, updateDoc, writeBatch,
-         serverTimestamp }                         from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+         deleteDoc, writeBatch,
+         serverTimestamp }                          from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey:            "AIzaSyCCR1Lj4i4o2X3rctLFU9YnhzAyqO7TL2k",
@@ -6897,6 +6897,7 @@ window.switchAuthTab = function(tab) {
    SHOW AUTH SCREEN (called from landing CTAs)
 ══════════════════════════════════════════ */
 window.showAuthScreen = function(defaultTab = 'login') {
+  _sessionLoaded = false; // allow onAuthStateChanged to fire again after re-login
   const lp = document.getElementById('landingPage');
   lp.style.transition = 'opacity 0.3s';
   lp.style.opacity = '0';
@@ -7036,20 +7037,22 @@ async function loadUserSession(firebaseUser) {
 
   // Update user menu UI
   const initials = displayName.split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
-  document.getElementById('userAvatar').textContent      = initials;
-  document.getElementById('userMenuName').textContent    = displayName.split(' ')[0];
+  document.getElementById('userAvatar').textContent       = initials;
+  document.getElementById('userMenuName').textContent     = displayName.split(' ')[0];
   document.getElementById('userMenuFullName').textContent = displayName;
   document.getElementById('userMenuUsername').textContent = email;
 
-  // Hide auth screen, enter app
+  // Hide auth screen instantly, then enter app
   const authEl = document.getElementById('authScreen');
-  authEl.style.transition = 'opacity 0.4s';
-  authEl.style.opacity = '0';
-  setTimeout(() => {
-    authEl.classList.remove('active');
-    authEl.style.opacity = '';
-    enterApp();
-  }, 400);
+  authEl.classList.remove('active');
+  authEl.style.opacity = '';
+
+  // Show the container before calling enterApp so it's never blank
+  const container = document.querySelector('.container');
+  if (container) container.style.display = '';
+
+  // Enter app — renders with the loaded data
+  enterApp();
 }
 
 /* ══════════════════════════════════════════
@@ -7134,6 +7137,7 @@ function _stripFbId(obj) {
    LOGOUT
 ══════════════════════════════════════════ */
 window.handleLogout = async function() {
+  _sessionLoaded = false;
   window.closeUserMenu();
   try { await signOut(auth); } catch(e) { console.warn(e); }
   window._currentUid = null;
@@ -7219,46 +7223,53 @@ document.addEventListener('click', function(e) {
 
 /* ══════════════════════════════════════════
    AUTH STATE OBSERVER
-   Runs on every page load — if user is already
-   signed in Firebase restores the session automatically.
+   - _appReady flag prevents enterApp() firing
+     before the user explicitly logs in
+   - _sessionLoaded prevents double-loading
 ══════════════════════════════════════════ */
+let _sessionLoaded = false;
+
 onAuthStateChanged(auth, async (user) => {
+  if (_sessionLoaded) return; // prevent double-firing
+
   if (user) {
-    // User is signed in — skip landing + auth, go straight to app
+    _sessionLoaded = true;
+
+    // Hide both landing and auth screens immediately
     const authEl = document.getElementById('authScreen');
     const lp     = document.getElementById('landingPage');
-    if (authEl.classList.contains('active')) {
-      // Coming from auth screen — loadUserSession handles the transition
-    } else {
-      // Page reload with existing session — hide landing silently
-      lp.classList.remove('active');
-      lp.style.display = 'none';
-      document.body.classList.remove('on-landing');
-    }
+    authEl.classList.remove('active');
+    lp.classList.remove('active');
+    lp.style.display = 'none';
+    document.body.classList.remove('on-landing');
+
     await loadUserSession(user);
+  } else {
+    // No session — show landing page, wait for user to click Sign In
+    // Landing page is already visible by default in HTML
+    // Do nothing here — CTAs call showAuthScreen()
   }
-  // If user is null: landing page is already showing, CTAs call showAuthScreen()
 });
 
 /* ══════════════════════════════════════════
-   PATCH app save() and saveAccounts() to also
-   write to Firestore after every local save
+   PATCH save() and saveAccounts() to also
+   write to Firestore on every change
 ══════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', () => {
-  // Patch save() — called after every trade add/edit/delete
   if (typeof window.save === 'function') {
     const _origSave = window.save;
     window.save = function() {
       _origSave();
-      window.fbSaveAllTrades && window.fbSaveAllTrades();
+      if (window._currentUid) window.fbSaveAllTrades && window.fbSaveAllTrades();
     };
   }
-  // Patch saveAccounts()
   if (typeof window.saveAccounts === 'function') {
     const _origSaveAccounts = window.saveAccounts;
     window.saveAccounts = function() {
       _origSaveAccounts();
-      (window.accounts || []).forEach(a => window.fbSaveAccount && window.fbSaveAccount(a));
+      if (window._currentUid) {
+        (window.accounts || []).forEach(a => window.fbSaveAccount && window.fbSaveAccount(a));
+      }
     };
   }
 });
